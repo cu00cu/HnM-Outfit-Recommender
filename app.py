@@ -548,12 +548,32 @@ left, right = st.columns([1, 2])
 
 with left:
     st.markdown("<div class='step'>Step 1 &mdash; Your item</div>", unsafe_allow_html=True)
-    uploaded = st.file_uploader("Photo of a top, bottom, dress or shoe", type=["jpg", "jpeg", "png"])
+
+    # Two ways to supply the item. st.camera_input returns the same kind of
+    # file-like object as st.file_uploader, so everything after this point
+    # is identical for both.
+    tab_upload, tab_camera = st.tabs(["Upload a photo", "Use camera"])
+
+    with tab_upload:
+        uploaded = st.file_uploader(
+            "Photo of a top, bottom, dress or shoe", type=["jpg", "jpeg", "png"]
+        )
+
+    with tab_camera:
+        snapshot = st.camera_input("Point at the item and take a photo")
+        if snapshot:
+            st.caption(
+                "Tip: fill the frame with the garment and avoid busy "
+                "backgrounds, so the colour is read from the clothing."
+            )
+
+    # a camera shot takes priority if both are present
+    source = snapshot if snapshot is not None else uploaded
 
     detected = None
-    if uploaded:
-        photo = Image.open(uploaded)
-        st.image(photo, caption="Your upload", width='stretch')
+    if source:
+        photo = Image.open(source)
+        st.image(photo, caption="Your item", width='stretch')
         detected = detect_colour(photo, sorted(df["baseColour"].unique()))
         st.success(f"Detected colour: **{detected}**")
 
