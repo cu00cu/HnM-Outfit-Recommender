@@ -129,8 +129,32 @@ COLOUR_WHEEL = {
 
 
 def season_ok(s1, s2):
-    """Seasons match if they are the same, or in the same warm/cold pair."""
+    """Seasons match if they are the same, or in the same warm/cold pair.
+
+    Used as an ELIGIBILITY gate in find_candidates() - unchanged, since
+    that filter is already tested. season_score() below is a separate,
+    graded version used only in RANKING, so an exact season match can
+    outscore a merely-adjacent one instead of both counting equally.
+    """
     return s1 == s2 or {"Fall", "Winter"} <= {s1, s2} or {"Spring", "Summer"} <= {s1, s2}
+
+
+def season_score(s1, s2):
+    """Graded season compatibility for ranking: 1.0 exact, 0.6 adjacent
+    (e.g. Spring/Summer), 0.0 opposite (e.g. Summer/Winter)."""
+    if s1 == s2:
+        return 1.0
+    if {"Fall", "Winter"} <= {s1, s2} or {"Spring", "Summer"} <= {s1, s2}:
+        return 0.6
+    return 0.0
+
+
+# How much each signal contributes to the content-based ranking score.
+# Kept as named constants (rather than inline numbers) so they can be
+# grid-searched against real evaluation data - see tune_weights.py.
+CONTENT_WEIGHT_STYLE = 0.4
+CONTENT_WEIGHT_COLOUR = 0.3
+CONTENT_WEIGHT_SEASON = 0.3
 
 
 def colour_score(c1, c2):
@@ -190,6 +214,7 @@ def build_similarity(df):
         df["gender"] + " " + df["usage"] + " " + df["season"] + " "
         + df["baseColour"].str.replace(" ", "") + " " + df["articleType"]
         + " " + df["look"].str.replace(r"[ /]", "", regex=True)
+        + " " + df["productDisplayName"].fillna("")
     )
     tfidf = TfidfVectorizer()
     tfidf_matrix = tfidf.fit_transform(soup)
@@ -208,7 +233,14 @@ def find_candidates(df, item, prefs):
     The filters come from what the USER selected (prefs), not from whichever
     catalogue item we matched them to. Gender is never dropped: relaxing it
     is what previously caused menswear to be suggested for a women's top.
-    Occasion and season are relaxed only if too few items remain.
+
+    Look is relaxed PER COMPLEMENTARY SLOT, not on the combined pool. A top
+    query needs both bottoms and shoes; if 200 bottoms match the look but
+    only 1 shoe does, checking the combined total (201) never triggers
+    relaxation, so the shoe slot stays starved even though shoes are
+    genuinely scarce for that look. Checking each slot on its own catches
+    this: bottoms stay strictly look-matched (there are plenty), shoes fall
+    back to the wider gendered pool (because there weren't enough).
     """
     base = df[df["slot"].isin(COMPLEMENT_SLOTS[item["slot"]])]
 
@@ -217,11 +249,15 @@ def find_candidates(df, item, prefs):
     if gendered.empty:
         gendered = base          # only if the sample has nothing for this gender
 
-    # Style ("look") is applied before occasion, because mixing gym wear with
-    # office wear looks worse than being one season out.
-    looked = gendered[gendered["look"] == prefs["look"]] if prefs.get("look") else gendered
-    if len(looked) < 5:
-        looked = gendered
+    MIN_PER_SLOT = 3
+    parts = []
+    for slot in COMPLEMENT_SLOTS[item["slot"]]:
+        slot_pool = gendered[gendered["slot"] == slot]
+        slot_looked = slot_pool[slot_pool["look"] == prefs["look"]] if prefs.get("look") else slot_pool
+        if len(slot_looked) < MIN_PER_SLOT:
+            slot_looked = slot_pool      # relax ONLY this slot, only because IT is scarce
+        parts.append(slot_looked)
+    looked = pd.concat(parts) if parts else gendered
 
     strict = looked[looked["season"].apply(lambda s: season_ok(s, prefs["season"]))]
     if len(strict) >= 5:
@@ -240,10 +276,15 @@ def get_recommendations(item_id, df, cosine_sim, indices, prefs, k=5, offset=0):
 
     positions = indices[candidates["id"]].values
     style = cosine_sim[idx, positions]
-    # colour is compared against what the USER chose, not the matched item
+    # colour and season are compared against what the USER chose, not the matched item
     colour = candidates["baseColour"].apply(lambda c: colour_score(prefs["colour"], c)).values
+    season = candidates["season"].apply(lambda s: season_score(s, prefs["season"])).values
 
-    candidates["score"] = 0.5 * style + 0.5 * colour
+    candidates["score"] = (
+        CONTENT_WEIGHT_STYLE * style
+        + CONTENT_WEIGHT_COLOUR * colour
+        + CONTENT_WEIGHT_SEASON * season
+    )
     return balanced_top_k(candidates, item["slot"], k, offset)
 
 
@@ -341,11 +382,20 @@ def collaborative_recommendations(item_id, df, item_sim, prefs, k=5, offset=0):
         & df["gender"].isin(allowed_genders)
     ].copy()
 
-    # keep the outfit in one style, same as the other two methods
+    # Keep the outfit in one style, same as the other two methods - but
+    # per complementary slot, same reasoning as find_candidates(): a
+    # combined check can leave a scarce slot (e.g. shoes) with nothing.
     if prefs.get("look"):
-        styled = candidates[candidates["look"] == prefs["look"]]
-        if len(styled) >= 3:
-            candidates = styled
+        MIN_PER_SLOT = 3
+        parts = []
+        for slot in COMPLEMENT_SLOTS[item["slot"]]:
+            slot_pool = candidates[candidates["slot"] == slot]
+            slot_styled = slot_pool[slot_pool["look"] == prefs["look"]]
+            if len(slot_styled) < MIN_PER_SLOT:
+                slot_styled = slot_pool
+            parts.append(slot_styled)
+        if parts:
+            candidates = pd.concat(parts)
 
     if candidates.empty:
         return []
@@ -368,7 +418,12 @@ def hybrid_recommendations(item_id, df, cosine_sim, indices, item_sim, prefs, k=
     positions = indices[candidates["id"]].values
     style = cosine_sim[idx, positions]
     colour = candidates["baseColour"].apply(lambda c: colour_score(prefs["colour"], c)).values
-    candidates["content"] = 0.5 * style + 0.5 * colour
+    season = candidates["season"].apply(lambda s: season_score(s, prefs["season"])).values
+    candidates["content"] = (
+        CONTENT_WEIGHT_STYLE * style
+        + CONTENT_WEIGHT_COLOUR * colour
+        + CONTENT_WEIGHT_SEASON * season
+    )
 
     if not item_sim.empty and item_id in item_sim.index:
         candidates["collab"] = candidates["id"].map(item_sim[item_id]).fillna(0)
@@ -404,13 +459,20 @@ def classify_pixel(rgb):
     hue = h * 360
 
     if s < 0.12:                                   # barely any colour: a neutral
-        if v < 0.18:
+        # Thresholds widened from an earlier version tuned only against pure
+        # synthetic colour swatches. Real phone photos of black fabric rarely
+        # measure near-zero brightness - camera auto-exposure lifts shadows
+        # to preserve visible detail, and fabric folds catch ambient light -
+        # so a narrow "v < 0.18" threshold was misreading real black garments
+        # as Charcoal or Grey. Verified against realistic photo brightness
+        # levels before widening.
+        if v < 0.35:
             return "Black"
-        if v < 0.45:
+        if v < 0.55:
             return "Charcoal"
-        if v < 0.68:
+        if v < 0.75:
             return "Grey"
-        if v < 0.88:
+        if v < 0.90:
             return "Silver"
         return "White"
 
@@ -552,6 +614,17 @@ with left:
     # Two ways to supply the item. st.camera_input returns the same kind of
     # file-like object as st.file_uploader, so everything after this point
     # is identical for both.
+    #
+    # camera_input keeps its captured photo across reruns as long as its key
+    # doesn't change, so a naive "camera wins if present" check gets stuck
+    # on the first photo forever, with no way to switch to a fresh upload.
+    # Giving it a key tied to a counter, and incrementing that counter on a
+    # "Remove photo" click, makes Streamlit treat it as a brand-new, empty
+    # widget - the standard way to reset a widget Streamlit has no built-in
+    # clear for.
+    if "camera_reset" not in st.session_state:
+        st.session_state.camera_reset = 0
+
     tab_upload, tab_camera = st.tabs(["Upload a photo", "Use camera"])
 
     with tab_upload:
@@ -560,12 +633,18 @@ with left:
         )
 
     with tab_camera:
-        snapshot = st.camera_input("Point at the item and take a photo")
+        snapshot = st.camera_input(
+            "Point at the item and take a photo",
+            key=f"camera_{st.session_state.camera_reset}",
+        )
         if snapshot:
             st.caption(
                 "Tip: fill the frame with the garment and avoid busy "
                 "backgrounds, so the colour is read from the clothing."
             )
+            if st.button("Remove photo"):
+                st.session_state.camera_reset += 1
+                st.rerun()
 
     # a camera shot takes priority if both are present
     source = snapshot if snapshot is not None else uploaded
