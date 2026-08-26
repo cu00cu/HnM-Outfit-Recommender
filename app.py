@@ -114,6 +114,7 @@ NEUTRALS = {
     "Black", "White", "Off White", "Grey", "Grey Melange", "Charcoal",
     "Navy Blue", "Beige", "Brown", "Coffee Brown", "Cream", "Silver",
     "Khaki", "Taupe", "Tan", "Nude", "Steel", "Mushroom Brown",
+    "Metal", "Mole",
 }
 
 # Position of each colour on the colour wheel (like hours on a clock).
@@ -157,6 +158,48 @@ CONTENT_WEIGHT_COLOUR = 0.3
 CONTENT_WEIGHT_SEASON = 0.3
 
 
+def _classify_colour(name):
+    """Resolve a real colour name to either ('neutral', None) or
+    ('wheel', position), tolerating case differences and compound names.
+
+    Exact matches (case-insensitive) are always checked first, across BOTH
+    lists, before any substring fallback - this matters because a compound
+    name can otherwise be wrongly captured by a shorter, unrelated substring.
+    For example 'Khaki green' contains the substring 'khaki', which is
+    itself a listed neutral colour, so a naive substring check classified
+    it as a neutral instead of resolving its own, more specific 'Khaki
+    Green' entry in the hue wheel. Checking exact matches first, and
+    preferring the LONGEST substring match when falling back, avoids this.
+    """
+    nl = name.lower()
+    if any(n.lower() == nl for n in NEUTRALS):
+        return ("neutral", None)
+    for k, v in COLOUR_WHEEL.items():
+        if k.lower() == nl:
+            return ("wheel", v)
+
+    best = None  # (match_length, kind, value)
+    for n in NEUTRALS:
+        if n.lower() in nl and (best is None or len(n) > best[0]):
+            best = (len(n), "neutral", None)
+    for k, v in COLOUR_WHEEL.items():
+        if k.lower() in nl and (best is None or len(k) > best[0]):
+            best = (len(k), "wheel", v)
+    if best:
+        return (best[1], best[2])
+    return (None, None)
+
+
+def _is_neutral(name):
+    kind, _ = _classify_colour(name)
+    return kind == "neutral"
+
+
+def _wheel_position(name):
+    kind, value = _classify_colour(name)
+    return value if kind == "wheel" else None
+
+
 def colour_score(c1, c2):
     """How well two colours work together, from 0.2 (clash) to 0.95 (classic).
 
@@ -164,7 +207,7 @@ def colour_score(c1, c2):
     made every candidate score the same, so colour stopped affecting the
     ranking at all. This version gives a graded score instead.
     """
-    n1, n2 = c1 in NEUTRALS, c2 in NEUTRALS
+    n1, n2 = _is_neutral(c1), _is_neutral(c2)
 
     if n1 and n2:
         return 0.95 if c1 != c2 else 0.85      # e.g. white + navy: classic
@@ -173,7 +216,7 @@ def colour_score(c1, c2):
     if c1 == c2:
         return 0.60                            # all one colour can look flat
 
-    p1, p2 = COLOUR_WHEEL.get(c1), COLOUR_WHEEL.get(c2)
+    p1, p2 = _wheel_position(c1), _wheel_position(c2)
     if p1 is None or p2 is None:
         return 0.50                            # unknown colour: neither good nor bad
 
@@ -495,11 +538,17 @@ def classify_pixel(rgb):
 
 
 def detect_colour(image, available):
-    """Guess the garment's colour from the photo.
+    """Guess the garment's colour from the photo, then match it to
+    whichever REAL colour in the catalogue is numerically closest.
 
-    Every pixel in the middle of the picture is named, then we take the most
-    common name. Plain white and silver are skipped first because they are
-    usually the background, not the item.
+    The previous version required the detected colour name to exactly
+    string-match one of the catalogue's real colour names, and fell back to
+    'available[0]' (whatever sorts first alphabetically) if it didn't -
+    completely disconnected from the photo whenever the match failed. This
+    version instead classifies the photo's colour (neutral, or a position on
+    the hue wheel) and finds the closest real colour by that classification,
+    so the system adapts to the photo rather than requiring the photo to
+    already match one of the catalogue's exact colour names.
     """
     rgb = image.convert("RGB")
     width, height = rgb.size
@@ -508,14 +557,26 @@ def detect_colour(image, available):
 
     counts = Counter(classify_pixel(p) for p in pixels)
     ranked = [name for name, _ in counts.most_common()]
+    # prefer the most common non-background colour, same as before
+    detected = next((n for n in ranked if n not in ("White", "Silver")), ranked[0])
 
-    for name in ranked:                            # prefer an actual colour
-        if name not in ("White", "Silver") and name in available:
-            return name
-    for name in ranked:                            # otherwise whatever we have
-        if name in available:
-            return name
-    return available[0]
+    d_kind, d_value = _classify_colour(detected)
+
+    best_name, best_dist = None, None
+    for name in available:
+        a_kind, a_value = _classify_colour(name)
+        if a_kind is None:
+            continue                                # this real name isn't recognised; skip it
+        if d_kind == "neutral" and a_kind == "neutral":
+            dist = 0
+        elif d_kind == "wheel" and a_kind == "wheel":
+            dist = min(abs(d_value - a_value), 12 - abs(d_value - a_value))
+        else:
+            dist = 6                                # a hue vs a neutral: a real but moderate mismatch
+        if best_dist is None or dist < best_dist:
+            best_name, best_dist = name, dist
+
+    return best_name if best_name is not None else available[0]
 
 
 # ---------------------------------------------------------------------------
