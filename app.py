@@ -501,6 +501,21 @@ def classify_pixel(rgb):
     h, s, v = colorsys.rgb_to_hsv(r, g, b)
     hue = h * 360
 
+    # HSV saturation is a ratio, so it becomes unreliable as brightness drops:
+    # when the brightest channel is already tiny, a difference of only a few
+    # RGB points produces a high saturation reading. A real photo of black
+    # leggings with a faint cool cast measured saturation 0.38 - well past the
+    # 0.12 neutral threshold below - and was therefore named "Purple". The
+    # rule here is that the darker a pixel is, the more saturated it must be
+    # before its hue is believed at all.
+    if v < 0.12:
+        return "Black"                             # too dark to read any hue
+    if v < 0.35 and s < 0.47:
+        # 0.47 sits between the highest saturation measured on real black
+        # fabric with a colour cast (0.40) and the lowest measured on a
+        # genuinely dark colour such as navy (0.545).
+        return "Black" if v < 0.25 else "Charcoal"  # dark with only a weak cast
+
     if s < 0.12:                                   # barely any colour: a neutral
         # Thresholds widened from an earlier version tuned only against pure
         # synthetic colour swatches. Real phone photos of black fabric rarely
