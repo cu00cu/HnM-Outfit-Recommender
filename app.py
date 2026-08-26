@@ -128,6 +128,14 @@ COLOUR_WHEEL = {
     "Magenta": 10, "Pink": 11, "Rose": 11,
 }
 
+# A full, standard colour vocabulary for the user to pick from directly -
+# not restricted to whichever real H&M colour names happen to survive
+# sampling into the current catalogue. Every name here is already an entry
+# in NEUTRALS or COLOUR_WHEEL above, so each one is guaranteed to resolve
+# correctly through colour_score, regardless of whether that exact name
+# exists on any real product in this session's data.
+UNIVERSAL_COLOURS = sorted(NEUTRALS | set(COLOUR_WHEEL.keys()))
+
 
 def season_ok(s1, s2):
     """Seasons match if they are the same, or in the same warm/cold pair.
@@ -714,7 +722,7 @@ with left:
     if source:
         photo = Image.open(source)
         st.image(photo, caption="Your item", width='stretch')
-        detected = detect_colour(photo, sorted(df["baseColour"].unique()))
+        detected = detect_colour(photo, UNIVERSAL_COLOURS)
         st.success(f"Detected colour: **{detected}**")
 
     st.markdown("<div class='step'>Step 2 &mdash; Confirm details</div>", unsafe_allow_html=True)
@@ -727,9 +735,13 @@ with left:
     options = sorted(df[df["slot"] == selected_slot]["articleType"].unique())
     article_type = st.selectbox("Specific type", options)
 
-    colours = sorted(df["baseColour"].unique())
+    colours = UNIVERSAL_COLOURS
     colour_index = colours.index(detected) if detected in colours else 0
-    colour = st.selectbox("Colour", colours, index=colour_index)
+    colour = st.selectbox(
+        "Colour", colours, index=colour_index,
+        help="Not limited to this session's product catalogue - pick "
+             "whatever best describes your item's real colour.",
+    )
 
     gender_options = sorted(df["gender"].unique())
     default_gender = gender_options.index("Women") if "Women" in gender_options else 0
@@ -771,7 +783,7 @@ with right:
             pool["match"] = (
                 (pool["look"] == look).astype(float) * 2      # style matters most
                 + pool["season"].apply(lambda s: float(season_ok(s, season)))
-                + (pool["baseColour"] == colour).astype(float)
+                + pool["baseColour"].apply(lambda c: colour_score(colour, c))
             )
             anchor_id = pool.sort_values("match", ascending=False).iloc[0]["id"]
 
