@@ -545,6 +545,22 @@ def classify_pixel(rgb):
     return name
 
 
+# Approximate brightness (0 = black, 1 = white) for every neutral, so two
+# neutrals can be compared by how similar they actually look rather than
+# treated as equally close just because both are "a neutral". Without this,
+# a dark colour like Navy Blue or Black matched EVERY neutral at an equal
+# distance of zero, so the nearest-match search simply returned whichever
+# neutral happened to sort first alphabetically (Beige) - wrong regardless
+# of what was actually detected.
+NEUTRAL_BRIGHTNESS = {
+    "Black": 0.10, "Navy Blue": 0.20, "Charcoal": 0.30, "Coffee Brown": 0.30,
+    "Mole": 0.35, "Brown": 0.40, "Mushroom Brown": 0.45, "Steel": 0.50,
+    "Grey": 0.55, "Grey Melange": 0.55, "Metal": 0.55, "Khaki": 0.60,
+    "Taupe": 0.60, "Tan": 0.65, "Nude": 0.70, "Beige": 0.75,
+    "Silver": 0.80, "Cream": 0.85, "Off White": 0.90, "White": 0.95,
+}
+
+
 def detect_colour(image, available):
     """Guess the garment's colour from the photo, then match it to
     whichever REAL colour in the catalogue is numerically closest.
@@ -576,7 +592,9 @@ def detect_colour(image, available):
         if a_kind is None:
             continue                                # this real name isn't recognised; skip it
         if d_kind == "neutral" and a_kind == "neutral":
-            dist = 0
+            db = NEUTRAL_BRIGHTNESS.get(detected, 0.5)
+            ab = NEUTRAL_BRIGHTNESS.get(name, 0.5)
+            dist = abs(db - ab) * 12             # scaled to the same range as wheel distance
         elif d_kind == "wheel" and a_kind == "wheel":
             dist = min(abs(d_value - a_value), 12 - abs(d_value - a_value))
         else:
