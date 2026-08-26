@@ -128,14 +128,6 @@ COLOUR_WHEEL = {
     "Magenta": 10, "Pink": 11, "Rose": 11,
 }
 
-# A full, standard colour vocabulary for the user to pick from directly -
-# not restricted to whichever real H&M colour names happen to survive
-# sampling into the current catalogue. Every name here is already an entry
-# in NEUTRALS or COLOUR_WHEEL above, so each one is guaranteed to resolve
-# correctly through colour_score, regardless of whether that exact name
-# exists on any real product in this session's data.
-UNIVERSAL_COLOURS = sorted(NEUTRALS | set(COLOUR_WHEEL.keys()))
-
 
 def season_ok(s1, s2):
     """Seasons match if they are the same, or in the same warm/cold pair.
@@ -561,18 +553,86 @@ NEUTRAL_BRIGHTNESS = {
 }
 
 
-def detect_colour(image, available):
-    """Guess the garment's colour from the photo, then match it to
-    whichever REAL colour in the catalogue is numerically closest.
+# The 16 everyday colour names offered to the user. Each maps to a name the
+# scoring logic already understands, so the picker can use plain language
+# ("Navy") without the user needing to know H&M's own vocabulary
+# ("Navy Blue", "Grey Melange", "Mole").
+STANDARD_COLOURS = {
+    "Black": "Black", "White": "White", "Grey": "Grey", "Silver": "Silver",
+    "Beige": "Beige", "Brown": "Brown", "Navy": "Navy Blue", "Maroon": "Maroon",
+    "Red": "Red", "Pink": "Pink", "Orange": "Orange", "Yellow": "Yellow",
+    "Green": "Green", "Teal": "Teal", "Blue": "Blue", "Purple": "Purple",
+}
 
-    The previous version required the detected colour name to exactly
-    string-match one of the catalogue's real colour names, and fell back to
-    'available[0]' (whatever sorts first alphabetically) if it didn't -
-    completely disconnected from the photo whenever the match failed. This
-    version instead classifies the photo's colour (neutral, or a position on
-    the hue wheel) and finds the closest real colour by that classification,
-    so the system adapts to the photo rather than requiring the photo to
-    already match one of the catalogue's exact colour names.
+
+def _interpretations(name):
+    """All valid readings of a colour name.
+
+    Some names legitimately belong to both groups - "Navy Blue" is a
+    wearable neutral AND a real position on the blue side of the colour
+    wheel. Returning both lets the distance function pick whichever
+    interpretation makes the two colours most comparable, instead of
+    forcing one reading and wrongly reporting an unrelated-colour gap.
+    """
+    readings = []
+    nl = name.lower()
+
+    is_neutral = any(n.lower() == nl for n in NEUTRALS) or \
+                 any(n.lower() in nl for n in NEUTRALS)
+    if is_neutral:
+        readings.append(("neutral", NEUTRAL_BRIGHTNESS.get(name, 0.5)))
+
+    pos = None
+    for k, v in COLOUR_WHEEL.items():
+        if k.lower() == nl:
+            pos = v
+            break
+    if pos is None:
+        for k, v in COLOUR_WHEEL.items():
+            if k.lower() in nl:
+                pos = v
+                break
+    if pos is not None:
+        readings.append(("wheel", pos))
+
+    return readings
+
+
+def colour_distance(a, b):
+    """How far apart two colour names are: 0 = identical, 12 = opposite.
+
+    Neutrals are compared by brightness, hues by their position on the
+    colour wheel. When a name has more than one valid reading, the closest
+    pairing wins.
+    """
+    ra, rb = _interpretations(a), _interpretations(b)
+    if not ra or not rb:
+        return 6.0
+
+    best = None
+    for ka, va in ra:
+        for kb, vb in rb:
+            if ka == "neutral" and kb == "neutral":
+                d = abs(va - vb) * 12
+            elif ka == "wheel" and kb == "wheel":
+                d = float(min(abs(va - vb), 12 - abs(va - vb)))
+            else:
+                d = 6.0
+            if best is None or d < best:
+                best = d
+    return best
+
+
+def detect_colour(image):
+    """Read the garment's colour straight from the photo.
+
+    Returns the classifier's own name (e.g. "Navy Blue", "Red"), WITHOUT
+    snapping it to the nearest entry in some fixed list. That snapping step
+    is what caused two separate real bugs: a dark navy jacket reported as
+    "Beige", and a bright red shirt reported as "Burgundy", because several
+    candidate names tied at the same distance and the tie was broken
+    alphabetically. Downstream scoring already compares colours by distance,
+    so the raw detected name is both more accurate and simpler here.
     """
     rgb = image.convert("RGB")
     width, height = rgb.size
@@ -581,28 +641,24 @@ def detect_colour(image, available):
 
     counts = Counter(classify_pixel(p) for p in pixels)
     ranked = [name for name, _ in counts.most_common()]
-    # prefer the most common non-background colour, same as before
-    detected = next((n for n in ranked if n not in ("White", "Silver")), ranked[0])
+    if not ranked:
+        return None
+    # white/silver are usually the backdrop rather than the garment
+    return next((n for n in ranked if n not in ("White", "Silver")), ranked[0])
 
-    d_kind, d_value = _classify_colour(detected)
 
-    best_name, best_dist = None, None
-    for name in available:
-        a_kind, a_value = _classify_colour(name)
-        if a_kind is None:
-            continue                                # this real name isn't recognised; skip it
-        if d_kind == "neutral" and a_kind == "neutral":
-            db = NEUTRAL_BRIGHTNESS.get(detected, 0.5)
-            ab = NEUTRAL_BRIGHTNESS.get(name, 0.5)
-            dist = abs(db - ab) * 12             # scaled to the same range as wheel distance
-        elif d_kind == "wheel" and a_kind == "wheel":
-            dist = min(abs(d_value - a_value), 12 - abs(d_value - a_value))
-        else:
-            dist = 6                                # a hue vs a neutral: a real but moderate mismatch
-        if best_dist is None or dist < best_dist:
-            best_name, best_dist = name, dist
+def resolve_query_colour(detected, chosen):
+    """Combine what the photo shows with what the user picked.
 
-    return best_name if best_name is not None else available[0]
+    If the two broadly agree, the detected name wins because it is more
+    specific - a photo read as "Navy Blue" is more precise than a user
+    picking the general "Blue". If they clearly disagree, the user's choice
+    wins, since they can see the real garment and the camera may have been
+    misled by lighting or background.
+    """
+    if not detected:
+        return chosen
+    return detected if colour_distance(detected, chosen) <= 2.5 else chosen
 
 
 # ---------------------------------------------------------------------------
@@ -740,8 +796,9 @@ with left:
     if source:
         photo = Image.open(source)
         st.image(photo, caption="Your item", width='stretch')
-        detected = detect_colour(photo, UNIVERSAL_COLOURS)
-        st.success(f"Detected colour: **{detected}**")
+        detected = detect_colour(photo)
+        if detected:
+            st.success(f"Detected colour from photo: **{detected}**")
 
     st.markdown("<div class='step'>Step 2 &mdash; Confirm details</div>", unsafe_allow_html=True)
     group_labels = {"Top": "top", "Bottom": "bottom", "Dress": "dress", "Shoes": "shoe"}
@@ -753,13 +810,31 @@ with left:
     options = sorted(df[df["slot"] == selected_slot]["articleType"].unique())
     article_type = st.selectbox("Specific type", options)
 
-    colours = UNIVERSAL_COLOURS
-    colour_index = colours.index(detected) if detected in colours else 0
-    colour = st.selectbox(
-        "Colour", colours, index=colour_index,
-        help="Not limited to this session's product catalogue - pick "
-             "whatever best describes your item's real colour.",
+    # Everyday colour names, not H&M's internal vocabulary. The photo's
+    # detected colour pre-selects the closest of these as a starting point,
+    # but the user can always override it.
+    friendly_names = list(STANDARD_COLOURS.keys())
+    if detected:
+        default_friendly = min(
+            friendly_names,
+            key=lambda f: colour_distance(detected, STANDARD_COLOURS[f]),
+        )
+    else:
+        default_friendly = "Black"
+    chosen_friendly = st.selectbox(
+        "Colour", friendly_names,
+        index=friendly_names.index(default_friendly),
+        help="Pick the everyday name that best describes your item. If it "
+             "broadly agrees with what the photo shows, the more specific "
+             "shade detected from the photo is used.",
     )
+
+    # Combine both signals: photo detection (specific) + user choice (reliable)
+    colour = resolve_query_colour(detected, STANDARD_COLOURS[chosen_friendly])
+    if detected and colour != STANDARD_COLOURS[chosen_friendly]:
+        st.caption(f"Using **{colour}** (more specific shade read from your photo).")
+    elif detected and colour_distance(detected, STANDARD_COLOURS[chosen_friendly]) > 2.5:
+        st.caption(f"Using your choice (**{colour}**) over the photo reading (**{detected}**).")
 
     gender_options = sorted(df["gender"].unique())
     default_gender = gender_options.index("Women") if "Women" in gender_options else 0
