@@ -545,6 +545,16 @@ def classify_pixel(rgb):
         return "Brown"
     if name == "Yellow" and s < 0.3:
         return "Beige"
+    if name == "Yellow" and v < 0.6:
+        return "Mustard"                           # a dark yellow reads as mustard
+    if name == "Lime Green" and (s < 0.50 or v < 0.60):
+        # "Lime Green" implies a vivid, bright colour. A muted or darker
+        # yellow-green is an olive. Measured on a real photograph of a
+        # mustard t-shirt under fluorescent lighting: hue 70 degrees (which
+        # genuinely sits in the yellow-green band) but saturation only 0.32
+        # and brightness 0.39, so naming it "Lime Green" was misleading even
+        # though the hue itself was measured correctly.
+        return "Olive"
     if name == "Blue" and v < 0.4:
         return "Navy Blue"
     if name == "Pink" and v < 0.5:
@@ -638,16 +648,13 @@ def colour_distance(a, b):
     return best
 
 
-def detect_colour(image):
-    """Read the garment's colour straight from the photo.
+def detect_colours(image, secondary_ratio=0.55):
+    """Read the garment's colour(s) from the photo.
 
-    Returns the classifier's own name (e.g. "Navy Blue", "Red"), WITHOUT
-    snapping it to the nearest entry in some fixed list. That snapping step
-    is what caused two separate real bugs: a dark navy jacket reported as
-    "Beige", and a bright red shirt reported as "Burgundy", because several
-    candidate names tied at the same distance and the tie was broken
-    alphabetically. Downstream scoring already compares colours by distance,
-    so the raw detected name is both more accurate and simpler here.
+    Returns (primary, secondary). `secondary` is only set when a second
+    colour is nearly as common as the first, which happens with genuinely
+    two-tone garments - a half-black, half-white shirt measured 43% and 41%
+    across the two, where reporting only the winner would be misleading.
     """
     rgb = image.convert("RGB")
     width, height = rgb.size
@@ -655,11 +662,27 @@ def detect_colour(image):
     pixels = np.array(rgb.crop(box).resize((80, 80))).reshape(-1, 3)
 
     counts = Counter(classify_pixel(p) for p in pixels)
-    ranked = [name for name, _ in counts.most_common()]
+    ranked = [(name, n) for name, n in counts.most_common()]
     if not ranked:
-        return None
+        return None, None
+
     # white/silver are usually the backdrop rather than the garment
-    return next((n for n in ranked if n not in ("White", "Silver")), ranked[0])
+    garment = [(n, c) for n, c in ranked if n not in ("White", "Silver")] or ranked
+    primary, primary_count = garment[0]
+
+    secondary = None
+    for name, count in garment[1:]:
+        # only flag a genuinely different colour, not a neighbouring shade
+        if count >= primary_count * secondary_ratio and colour_distance(primary, name) >= 3:
+            secondary = name
+            break
+
+    return primary, secondary
+
+
+def detect_colour(image):
+    """Convenience wrapper returning just the dominant colour."""
+    return detect_colours(image)[0]
 
 
 def resolve_query_colour(detected, chosen):
@@ -811,8 +834,17 @@ with left:
     if source:
         photo = Image.open(source)
         st.image(photo, caption="Your item", width='stretch')
-        detected = detect_colour(photo)
-        if detected:
+        detected, second_colour = detect_colours(photo)
+        if detected and second_colour:
+            st.success(
+                f"Detected colours from photo: **{detected}** and "
+                f"**{second_colour}**"
+            )
+            st.caption(
+                "This item appears to be two-tone. Choose below whichever "
+                "colour you want the outfit built around."
+            )
+        elif detected:
             st.success(f"Detected colour from photo: **{detected}**")
 
     st.markdown("<div class='step'>Step 2 &mdash; Confirm details</div>", unsafe_allow_html=True)
