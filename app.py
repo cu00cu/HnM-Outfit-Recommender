@@ -55,8 +55,6 @@ INTERACTIONS_PATH = os.path.join(DATA_DIR, "interactions.csv")
 # product_group_name (Garment Upper body / Lower body / Full body / Shoes) -
 # a small, stable set of 4 categories.
 # ---------------------------------------------------------------------------
-SLOTS = ["top", "bottom", "dress", "shoe"]
-
 # Which slots COMPLETE a given slot
 COMPLEMENT_SLOTS = {
     "top":    ["bottom", "shoe"],
@@ -87,12 +85,7 @@ OUTFIT_QUOTA = {
 }
 
 # ---------------------------------------------------------------------------
-# "Look" (dress style) - DERIVED, not a column in the dataset.
-#
-# The Kaggle data has no field for cultural or regional dress style, so we do
-# not invent one. Instead we derive a practical style label from two real
-# columns, `usage` and `articleType`. This is a rule we defined ourselves and
-# should be described in the report as a derived feature, not as ground truth.
+# "Look" (dress style) - DERIVED, not a raw column in the dataset.
 # ---------------------------------------------------------------------------
 # Style ("look") is precomputed by the export script from H&M's real
 # section_name / garment_group_name columns, so no derivation is needed here.
@@ -685,11 +678,6 @@ def detect_colours(image, secondary_ratio=0.55):
     return primary, secondary
 
 
-def detect_colour(image):
-    """Convenience wrapper returning just the dominant colour."""
-    return detect_colours(image)[0]
-
-
 def resolve_query_colour(detected, chosen):
     """Combine what the photo shows with what the user picked.
 
@@ -708,18 +696,12 @@ def resolve_query_colour(detected, chosen):
 # User interface
 # ---------------------------------------------------------------------------
 # ---------------------------------------------------------------------------
-# Styling. Ink-blue and warm sand, set in Fraunces (a high-contrast display
-# face used only for the wordmark) over Inter for everything else. The rule
-# under each method name is the structural device: it separates the three
-# recommenders without adding boxes.
-# ---------------------------------------------------------------------------
-# ---------------------------------------------------------------------------
-# Styling. Deliberately conservative: this only styles our own elements and
-# does not reach into Streamlit's internal DOM, because overriding Streamlit's
-# own containers breaks rendering when the deployed version differs from local.
-# ---------------------------------------------------------------------------
-# ---------------------------------------------------------------------------
-# Styling.
+# Styling. Ink-blue and warm sand: Fraunces (a high-contrast display face) for
+# the wordmark, Inter for everything else. Deliberately conservative - it only
+# styles our own elements and never reaches into Streamlit's internal DOM,
+# because overriding Streamlit's own containers breaks rendering whenever the
+# deployed version differs from the local one.
+#
 # IMPORTANT: no blank lines are allowed inside the <style> block below. In
 # Markdown a blank line ends a raw HTML block, so everything after it would be
 # printed on the page as plain text instead of being applied as CSS.
