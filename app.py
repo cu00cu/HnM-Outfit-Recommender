@@ -347,8 +347,13 @@ def balanced_top_k(candidates, query_slot, k=5, offset=0):
             continue
         # `offset` lets the user ask for another outfit: we step further down
         # the ranked list instead of returning the same items again.
-        start = (offset * count) % len(in_slot)
-        picks = (in_slot + in_slot)[start:start + count]
+        # Never ask for more items than this slot actually has, or the
+        # wrap-around below returns the SAME item more than once (measured:
+        # 100 of 1440 swept combinations returned a duplicate product before
+        # this guard, e.g. a scarce Loungewear bottoms pool).
+        take = min(count, len(in_slot))
+        start = (offset * take) % len(in_slot)
+        picks = (in_slot + in_slot)[start:start + take]
         chosen.extend(picks)
 
     # if a slot had too few items, top up with the next best of anything
