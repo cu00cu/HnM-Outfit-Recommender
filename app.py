@@ -39,6 +39,27 @@ from sklearn.feature_extraction.text import TfidfVectorizer
 from sklearn.metrics.pairwise import linear_kernel, cosine_similarity
 from scipy.sparse import csr_matrix
 
+# ---------------------------------------------------------------------------
+# Optional visual-understanding extras (YOLOv8 + CLIP).
+#
+# These are imported defensively. They pull in PyTorch, which is large and may
+# be unavailable or run out of memory on a constrained deployment host. If
+# either import fails the app must still start and work exactly as before,
+# falling back to centre-crop colour sampling and manual category selection -
+# a missing optional feature should never take the whole application down.
+# ---------------------------------------------------------------------------
+try:
+    from ultralytics import YOLO
+    YOLO_AVAILABLE = True
+except Exception:
+    YOLO_AVAILABLE = False
+
+try:
+    from transformers import CLIPProcessor, CLIPModel
+    CLIP_AVAILABLE = True
+except Exception:
+    CLIP_AVAILABLE = False
+
 st.set_page_config(page_title="Outfit Recommender", layout="wide")
 
 DATA_DIR = "sample_data"
@@ -646,18 +667,26 @@ def colour_distance(a, b):
     return best
 
 
-def detect_colours(image, secondary_ratio=0.55):
+def detect_colours(image, secondary_ratio=0.55, crop_centre=True):
     """Read the garment's colour(s) from the photo.
 
     Returns (primary, secondary). `secondary` is only set when a second
     colour is nearly as common as the first, which happens with genuinely
     two-tone garments - a half-black, half-white shirt measured 43% and 41%
     across the two, where reporting only the winner would be misleading.
+
+    `crop_centre` samples only the middle 60% of the frame, on the assumption
+    that the garment is centred and the edges are background. When the image
+    has ALREADY been cropped to the detected garment (see crop_to_garment()),
+    that assumption no longer holds and the centre crop would simply throw
+    away 40% of the garment itself, so the caller passes crop_centre=False.
     """
     rgb = image.convert("RGB")
-    width, height = rgb.size
-    box = (int(width * 0.2), int(height * 0.2), int(width * 0.8), int(height * 0.8))
-    pixels = np.array(rgb.crop(box).resize((80, 80))).reshape(-1, 3)
+    if crop_centre:
+        width, height = rgb.size
+        box = (int(width * 0.2), int(height * 0.2), int(width * 0.8), int(height * 0.8))
+        rgb = rgb.crop(box)
+    pixels = np.array(rgb.resize((80, 80))).reshape(-1, 3)
 
     counts = Counter(classify_pixel(p) for p in pixels)
     ranked = [(name, n) for name, n in counts.most_common()]
@@ -676,6 +705,153 @@ def detect_colours(image, secondary_ratio=0.55):
             break
 
     return primary, secondary
+
+
+# ---------------------------------------------------------------------------
+# Optional step - visual understanding of the uploaded photo
+#
+# Two separate jobs, done by two different models:
+#
+#   1. YOLOv8 (crop_to_garment)  - finds WHERE the item is in the frame and
+#      crops to it. Note that yolov8n is trained on COCO, whose 80 classes
+#      contain no clothing categories, so it is used purely as a generic
+#      object locator to replace the fixed centre-crop assumption - NOT to
+#      identify what the garment is.
+#
+#   2. CLIP (classify_slot / classify_article_type) - decides WHAT the item
+#      is, by scoring the photo against text descriptions of each candidate
+#      category. This is zero-shot: no fashion-specific training was done,
+#      the model simply compares image and text in a shared embedding space.
+#
+# Every function here degrades safely: on any failure it returns None and the
+# caller falls back to the original manual behaviour.
+# ---------------------------------------------------------------------------
+YOLO_MIN_CONFIDENCE = 0.35    # ignore weak detections
+YOLO_MIN_AREA_RATIO = 0.10    # ignore boxes covering < 10% of the frame
+
+
+@st.cache_resource
+def load_yolo():
+    """Load YOLOv8 once and reuse it. cache_resource (not cache_data) is the
+    correct decorator for a model object: it is shared, not copied."""
+    if not YOLO_AVAILABLE:
+        return None
+    try:
+        return YOLO("yolov8n.pt")
+    except Exception:
+        return None
+
+
+def crop_to_garment(image):
+    """Crop the photo to the most prominent detected object.
+
+    Returns (cropped_image, was_cropped). Falls back to the original image
+    whenever detection is unavailable, finds nothing, or finds only small or
+    low-confidence boxes - a bad crop is worse than no crop, because it would
+    feed the colour reader a picture of the background.
+    """
+    model = load_yolo()
+    if model is None:
+        return image, False
+
+    rgb = image.convert("RGB")
+    try:
+        results = model(rgb, verbose=False)
+    except Exception:
+        return rgb, False
+
+    if not results or results[0].boxes is None or len(results[0].boxes) == 0:
+        return rgb, False
+
+    boxes = results[0].boxes
+    frame_area = rgb.size[0] * rgb.size[1]
+
+    best, best_conf = None, 0.0
+    for i in range(len(boxes)):
+        try:
+            conf = float(boxes.conf[i])
+            x1, y1, x2, y2 = [float(v) for v in boxes.xyxy[i].tolist()]
+        except Exception:
+            continue
+        area = max(0.0, x2 - x1) * max(0.0, y2 - y1)
+        # Take the highest-CONFIDENCE box, not simply the first one returned:
+        # detection order is not quality order, so "boxes[0]" can easily be a
+        # chair or a background object rather than the item being photographed.
+        if conf >= YOLO_MIN_CONFIDENCE and area >= YOLO_MIN_AREA_RATIO * frame_area:
+            if conf > best_conf:
+                best, best_conf = (x1, y1, x2, y2), conf
+
+    if best is None:
+        return rgb, False
+
+    x1, y1, x2, y2 = [int(v) for v in best]
+    return rgb.crop((x1, y1, x2, y2)), True
+
+
+@st.cache_resource
+def load_clip():
+    if not CLIP_AVAILABLE:
+        return None, None
+    try:
+        model = CLIPModel.from_pretrained("openai/clip-vit-base-patch32")
+        processor = CLIPProcessor.from_pretrained("openai/clip-vit-base-patch32")
+        return model, processor
+    except Exception:
+        return None, None
+
+
+def _clip_rank(image, labels):
+    """Score one image against a list of text descriptions.
+
+    Returns a list of (label_index, probability) sorted highest-first, or an
+    empty list if CLIP is unavailable. This is the single place CLIP is
+    actually called; both classifiers below are thin wrappers around it.
+    """
+    model, processor = load_clip()
+    if model is None or not labels:
+        return []
+    try:
+        inputs = processor(text=labels, images=image, return_tensors="pt", padding=True)
+        outputs = model(**inputs)
+        probs = outputs.logits_per_image.softmax(dim=1)[0].tolist()
+    except Exception:
+        return []
+    return sorted(enumerate(probs), key=lambda pair: pair[1], reverse=True)
+
+
+SLOT_PROMPTS = {
+    "top":    "a photo of a shirt, t-shirt, sweater or jacket",
+    "bottom": "a photo of trousers, jeans, shorts or a skirt",
+    "dress":  "a photo of a dress",
+    "shoe":   "a photo of shoes",
+}
+
+
+def classify_slot(image):
+    """Predict which outfit slot the photo shows. Returns (slot, confidence)
+    or (None, 0.0) if unavailable."""
+    slots = list(SLOT_PROMPTS.keys())
+    ranked = _clip_rank(image, [SLOT_PROMPTS[s] for s in slots])
+    if not ranked:
+        return None, 0.0
+    idx, prob = ranked[0]
+    return slots[idx], prob
+
+
+def classify_article_type(image, options):
+    """Predict the specific article type from the real options available for
+    this slot in the catalogue. Returns (option, confidence) or (None, 0.0).
+
+    The candidate list comes from the dataset itself rather than a fixed list,
+    so this adapts automatically to whatever product types are present.
+    """
+    if not options:
+        return None, 0.0
+    ranked = _clip_rank(image, [f"a photo of {o.lower()}" for o in options])
+    if not ranked:
+        return None, 0.0
+    idx, prob = ranked[0]
+    return options[idx], prob
 
 
 def resolve_query_colour(detected, chosen):
@@ -818,10 +994,39 @@ with left:
     source = snapshot if snapshot is not None else uploaded
 
     detected = None
+    predicted_slot = None
+    predicted_type = None
     if source:
         photo = Image.open(source)
-        st.image(photo, caption="Your item", width='stretch')
-        detected, second_colour = detect_colours(photo)
+
+        # Step A - locate the garment. If YOLO isn't available or finds
+        # nothing convincing, `was_cropped` is False and everything below
+        # behaves exactly as it did before this feature existed.
+        garment, was_cropped = crop_to_garment(photo)
+
+        if was_cropped:
+            preview_a, preview_b = st.columns(2)
+            with preview_a:
+                st.image(photo, caption="Your item", width='stretch')
+            with preview_b:
+                st.image(garment, caption="Detected item", width='stretch')
+        else:
+            st.image(photo, caption="Your item", width='stretch')
+
+        # Step B - identify what it is. Only a suggestion: it pre-selects the
+        # dropdowns below, and the user can always override it.
+        predicted_slot, slot_conf = classify_slot(garment)
+        if predicted_slot:
+            pretty = {"top": "Top", "bottom": "Bottom",
+                      "dress": "Dress", "shoe": "Shoes"}[predicted_slot]
+            st.info(f"Detected item type: **{pretty}** ({slot_conf:.0%} confidence)")
+            type_options = sorted(df[df["slot"] == predicted_slot]["articleType"].unique())
+            predicted_type, _type_conf = classify_article_type(garment, list(type_options))
+
+        # Step C - read the colour. Sample the whole crop when YOLO already
+        # isolated the garment; otherwise fall back to the centre-crop
+        # assumption the original version relied on.
+        detected, second_colour = detect_colours(garment, crop_centre=not was_cropped)
         if detected and second_colour:
             st.success(
                 f"Detected colours from photo: **{detected}** and "
@@ -836,13 +1041,25 @@ with left:
 
     st.markdown("<div class='step'>Step 2 &mdash; Confirm details</div>", unsafe_allow_html=True)
     group_labels = {"Top": "top", "Bottom": "bottom", "Dress": "dress", "Shoes": "shoe"}
-    group = st.selectbox("Item type", list(group_labels.keys()))
+    group_names = list(group_labels.keys())
+    # If the photo was classified, start the dropdown on that prediction. The
+    # user keeps the final say - the prediction only changes which option is
+    # selected FIRST, never what they are allowed to choose.
+    slot_to_name = {v: k for k, v in group_labels.items()}
+    group_index = group_names.index(slot_to_name[predicted_slot]) if predicted_slot else 0
+    group = st.selectbox("Item type", group_names, index=group_index)
     selected_slot = group_labels[group]
     # Specific types are read directly from the data rather than a fixed list,
     # since H&M's real product_type_name has far more distinct values than a
     # hand-written list could practically enumerate.
     options = sorted(df[df["slot"] == selected_slot]["articleType"].unique())
-    article_type = st.selectbox("Specific type", options)
+    # Only apply the predicted article type if the user kept the predicted
+    # slot - otherwise the prediction belongs to a different category and its
+    # options list no longer applies.
+    type_index = 0
+    if predicted_type and selected_slot == predicted_slot and predicted_type in options:
+        type_index = list(options).index(predicted_type)
+    article_type = st.selectbox("Specific type", options, index=type_index)
 
     # Everyday colour names, not H&M's internal vocabulary. The photo's
     # detected colour pre-selects the closest of these as a starting point,

@@ -4,3 +4,12 @@ numpy
 scikit-learn
 scipy
 pillow
+
+# Optional visual-understanding extras (YOLOv8 object crop + CLIP zero-shot
+# classification). These pull in PyTorch and are large. app.py imports them
+# defensively, so if the deployment host cannot install or load them the
+# application still runs with manual category selection and centre-crop
+# colour sampling.
+ultralytics
+transformers
+torch
